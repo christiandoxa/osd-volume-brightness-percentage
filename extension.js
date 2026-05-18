@@ -17,8 +17,9 @@ import {
 
 // --- Brightness indicator panel widget ---
 
-const BACKLIGHT_DIR = '/sys/class/backlight/amdgpu_bl1';
-const BACKLIGHT_POLL_SECONDS = 2;
+const BACKLIGHT_ROOT = '/sys/class/backlight';
+const BRIGHTNESS_POLL_SECONDS = 2;
+const DDCUTIL_POLL_SECONDS = 10;
 
 const BrightnessIndicator = GObject.registerClass(
 class BrightnessIndicator extends St.BoxLayout {
@@ -43,17 +44,19 @@ class BrightnessIndicator extends St.BoxLayout {
   }
 
   _connectBrightness() {
-    if (this._connectBacklight())
-      return;
-
     this._brightnessScale = Main.brightnessManager?.globalScale ?? this._getBrightnessSlider();
-    if (this._brightnessScale) {
-      this._updateFromScale();
-      this._signalId = this._brightnessScale.connect('notify::value', () => this._updateFromScale());
-      return;
-    }
+    if (this._brightnessScale)
+      this._signalId = this._brightnessScale.connect('notify::value', () => this._refreshBrightness());
 
-    this._label.text = 'N/A';
+    this._refreshBrightness();
+    this._brightnessTimeoutId = GLib.timeout_add_seconds(
+      GLib.PRIORITY_DEFAULT,
+      BRIGHTNESS_POLL_SECONDS,
+      () => {
+        this._refreshBrightness();
+        return GLib.SOURCE_CONTINUE;
+      }
+    );
   }
 
   _getBrightnessSlider() {
@@ -61,36 +64,23 @@ class BrightnessIndicator extends St.BoxLayout {
     return item?.slider ?? item?._slider ?? null;
   }
 
-  _connectBacklight() {
-    this._backlightPaths = this._getBacklightPaths();
-    if (!this._backlightPaths) {
+  _refreshBrightness() {
+    if (this._updateFromBacklight())
+      return;
+
+    this._queueDdcutilUpdate();
+    if (this._updateFromDdcutilCache())
+      return;
+
+    if (this._updateFromScale())
+      return;
+
+    if (!this._ddcutilPending)
       this._label.text = 'N/A';
-      return false;
-    }
-
-    this._updateFromBacklight();
-
-    try {
-      this._backlightMonitor = Gio.File.new_for_path(this._backlightPaths.brightness)
-        .monitor_file(Gio.FileMonitorFlags.NONE, null);
-      this._backlightMonitorId = this._backlightMonitor.connect('changed', () => this._updateFromBacklight());
-    } catch (_) {}
-
-    this._backlightTimeoutId = GLib.timeout_add_seconds(
-      GLib.PRIORITY_DEFAULT,
-      BACKLIGHT_POLL_SECONDS,
-      () => {
-        this._updateFromBacklight();
-        return GLib.SOURCE_CONTINUE;
-      }
-    );
-
-    return true;
   }
 
   _getBacklightPaths() {
-    const candidates = [BACKLIGHT_DIR, ...this._listBacklightDirs()];
-    for (const dir of candidates) {
+    for (const dir of this._listBacklightDirs()) {
       const brightness = `${dir}/brightness`;
       const max = `${dir}/max_brightness`;
       if (GLib.file_test(brightness, GLib.FileTest.EXISTS) &&
@@ -103,7 +93,7 @@ class BrightnessIndicator extends St.BoxLayout {
   _listBacklightDirs() {
     const dirs = [];
     try {
-      const root = Gio.File.new_for_path('/sys/class/backlight');
+      const root = Gio.File.new_for_path(BACKLIGHT_ROOT);
       const enumerator = root.enumerate_children(
         'standard::name,standard::type',
         Gio.FileQueryInfoFlags.NONE,
@@ -112,7 +102,7 @@ class BrightnessIndicator extends St.BoxLayout {
       let info;
       while ((info = enumerator.next_file(null)) !== null) {
         if (info.get_file_type() === Gio.FileType.DIRECTORY)
-          dirs.push(`/sys/class/backlight/${info.get_name()}`);
+          dirs.push(`${BACKLIGHT_ROOT}/${info.get_name()}`);
       }
       enumerator.close(null);
     } catch (_) {}
@@ -132,40 +122,101 @@ class BrightnessIndicator extends St.BoxLayout {
   }
 
   _updateFromScale() {
+    if (!this._brightnessScale || !Number.isFinite(this._brightnessScale.value))
+      return false;
     this._label.text = `${Math.round(this._brightnessScale.value * 100)}%`;
+    return true;
   }
 
   _updateFromBacklight() {
-    const current = this._readInt(this._backlightPaths.brightness);
-    const max = this._readInt(this._backlightPaths.max);
-    if (current === null || max === null || max <= 0) {
-      this._label.text = 'N/A';
-      return;
-    }
+    const paths = this._getBacklightPaths();
+    if (!paths)
+      return false;
+
+    const current = this._readInt(paths.brightness);
+    const max = this._readInt(paths.max);
+    if (current === null || max === null || max <= 0)
+      return false;
 
     const percent = Math.max(0, Math.min(100, Math.round(current / max * 100)));
     this._label.text = `${percent}%`;
+    return true;
+  }
+
+  _queueDdcutilUpdate() {
+    if (this._ddcutilPending || !GLib.find_program_in_path('ddcutil'))
+      return false;
+
+    const now = GLib.get_monotonic_time();
+    if (this._lastDdcutilPollUs &&
+        now - this._lastDdcutilPollUs < DDCUTIL_POLL_SECONDS * GLib.USEC_PER_SEC)
+      return false;
+
+    this._lastDdcutilPollUs = now;
+    this._ddcutilPending = true;
+
+    try {
+      const proc = Gio.Subprocess.new(
+        ['ddcutil', 'getvcp', '10'],
+        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+      );
+      proc.communicate_utf8_async(null, null, (proc, res) => {
+        this._ddcutilPending = false;
+        if (this._destroyed)
+          return;
+
+        try {
+          const [, stdout, stderr] = proc.communicate_utf8_finish(res);
+          const percent = this._parseDdcutilPercent(`${stdout ?? ''}\n${stderr ?? ''}`);
+          this._ddcutilPercent = percent;
+          if (percent !== null)
+            this._label.text = `${percent}%`;
+        } catch (_) {
+          this._ddcutilPercent = null;
+        }
+      });
+      return true;
+    } catch (_) {
+      this._ddcutilPending = false;
+      this._ddcutilPercent = null;
+      return false;
+    }
+  }
+
+  _updateFromDdcutilCache() {
+    if (this._ddcutilPercent === null || this._ddcutilPercent === undefined)
+      return false;
+
+    this._label.text = `${this._ddcutilPercent}%`;
+    return true;
+  }
+
+  _parseDdcutilPercent(output) {
+    const briefMatch = output.match(/\bVCP\s+10\s+C\s+(\d+)\s+(\d+)\b/i);
+    const longMatch = output.match(/current value\s*=\s*(\d+),\s*max value\s*=\s*(\d+)/i);
+    const match = briefMatch ?? longMatch;
+    if (!match)
+      return null;
+
+    const current = Number.parseInt(match[1], 10);
+    const max = Number.parseInt(match[2], 10);
+    if (!Number.isFinite(current) || !Number.isFinite(max) || max <= 0)
+      return null;
+
+    return Math.max(0, Math.min(100, Math.round(current / max * 100)));
   }
 
   destroy() {
+    this._destroyed = true;
     if (this._signalId) {
       this._brightnessScale.disconnect(this._signalId);
       this._signalId = null;
     }
     this._brightnessScale = null;
-    if (this._backlightMonitorId) {
-      this._backlightMonitor.disconnect(this._backlightMonitorId);
-      this._backlightMonitorId = null;
+    if (this._brightnessTimeoutId) {
+      GLib.Source.remove(this._brightnessTimeoutId);
+      this._brightnessTimeoutId = null;
     }
-    if (this._backlightMonitor) {
-      this._backlightMonitor.cancel();
-      this._backlightMonitor = null;
-    }
-    if (this._backlightTimeoutId) {
-      GLib.Source.remove(this._backlightTimeoutId);
-      this._backlightTimeoutId = null;
-    }
-    this._backlightPaths = null;
     super.destroy();
   }
 });
