@@ -5,6 +5,7 @@
   "name": "OSD Volume Brightness Percentage",
   "settings-schema": "org.gnome.shell.extensions.osd-volume-brightness-percentage",
   "shell-version": [
+    "46",
     "49",
     "50"
   ],

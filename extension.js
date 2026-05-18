@@ -4,6 +4,7 @@
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
+import GLib from 'gi://GLib';
 import St from 'gi://St';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -15,6 +16,9 @@ import {
 } from './modules/slider.js';
 
 // --- Brightness indicator panel widget ---
+
+const BACKLIGHT_DIR = '/sys/class/backlight/amdgpu_bl1';
+const BACKLIGHT_POLL_SECONDS = 2;
 
 const BrightnessIndicator = GObject.registerClass(
 class BrightnessIndicator extends St.BoxLayout {
@@ -39,17 +43,108 @@ class BrightnessIndicator extends St.BoxLayout {
   }
 
   _connectBrightness() {
-    if (!Main.brightnessManager?.globalScale) {
+    if (this._connectBacklight())
+      return;
+
+    this._brightnessScale = Main.brightnessManager?.globalScale ?? this._getBrightnessSlider();
+    if (this._brightnessScale) {
+      this._updateFromScale();
+      this._signalId = this._brightnessScale.connect('notify::value', () => this._updateFromScale());
+      return;
+    }
+
+    this._label.text = 'N/A';
+  }
+
+  _getBrightnessSlider() {
+    const item = Main.panel.statusArea.quickSettings?._brightness?.quickSettingsItems?.[0];
+    return item?.slider ?? item?._slider ?? null;
+  }
+
+  _connectBacklight() {
+    this._backlightPaths = this._getBacklightPaths();
+    if (!this._backlightPaths) {
+      this._label.text = 'N/A';
+      return false;
+    }
+
+    this._updateFromBacklight();
+
+    try {
+      this._backlightMonitor = Gio.File.new_for_path(this._backlightPaths.brightness)
+        .monitor_file(Gio.FileMonitorFlags.NONE, null);
+      this._backlightMonitorId = this._backlightMonitor.connect('changed', () => this._updateFromBacklight());
+    } catch (_) {}
+
+    this._backlightTimeoutId = GLib.timeout_add_seconds(
+      GLib.PRIORITY_DEFAULT,
+      BACKLIGHT_POLL_SECONDS,
+      () => {
+        this._updateFromBacklight();
+        return GLib.SOURCE_CONTINUE;
+      }
+    );
+
+    return true;
+  }
+
+  _getBacklightPaths() {
+    const candidates = [BACKLIGHT_DIR, ...this._listBacklightDirs()];
+    for (const dir of candidates) {
+      const brightness = `${dir}/brightness`;
+      const max = `${dir}/max_brightness`;
+      if (GLib.file_test(brightness, GLib.FileTest.EXISTS) &&
+          GLib.file_test(max, GLib.FileTest.EXISTS))
+        return { brightness, max };
+    }
+    return null;
+  }
+
+  _listBacklightDirs() {
+    const dirs = [];
+    try {
+      const root = Gio.File.new_for_path('/sys/class/backlight');
+      const enumerator = root.enumerate_children(
+        'standard::name,standard::type',
+        Gio.FileQueryInfoFlags.NONE,
+        null
+      );
+      let info;
+      while ((info = enumerator.next_file(null)) !== null) {
+        if (info.get_file_type() === Gio.FileType.DIRECTORY)
+          dirs.push(`/sys/class/backlight/${info.get_name()}`);
+      }
+      enumerator.close(null);
+    } catch (_) {}
+    return dirs.filter((dir, index) => dirs.indexOf(dir) === index);
+  }
+
+  _readInt(path) {
+    try {
+      const [ok, contents] = GLib.file_get_contents(path);
+      if (!ok)
+        return null;
+      const value = Number.parseInt(new TextDecoder().decode(contents).trim(), 10);
+      return Number.isFinite(value) ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _updateFromScale() {
+    this._label.text = `${Math.round(this._brightnessScale.value * 100)}%`;
+  }
+
+  _updateFromBacklight() {
+    const current = this._readInt(this._backlightPaths.brightness);
+    const max = this._readInt(this._backlightPaths.max);
+    if (current === null || max === null || max <= 0) {
       this._label.text = 'N/A';
       return;
     }
-    this._brightnessScale = Main.brightnessManager.globalScale;
-    this._update();
-    this._signalId = this._brightnessScale.connect('notify::value', () => this._update());
-  }
 
-  _update() {
-    this._label.text = `${Math.round(this._brightnessScale.value * 100)}%`;
+    const percent = Math.max(0, Math.min(100, Math.round(current / max * 100)));
+    this._label.text = `${percent}%`;
   }
 
   destroy() {
@@ -58,6 +153,19 @@ class BrightnessIndicator extends St.BoxLayout {
       this._signalId = null;
     }
     this._brightnessScale = null;
+    if (this._backlightMonitorId) {
+      this._backlightMonitor.disconnect(this._backlightMonitorId);
+      this._backlightMonitorId = null;
+    }
+    if (this._backlightMonitor) {
+      this._backlightMonitor.cancel();
+      this._backlightMonitor = null;
+    }
+    if (this._backlightTimeoutId) {
+      GLib.Source.remove(this._backlightTimeoutId);
+      this._backlightTimeoutId = null;
+    }
+    this._backlightPaths = null;
     super.destroy();
   }
 });
